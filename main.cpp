@@ -504,11 +504,21 @@ int main() {
 
                     teams[idx].recalc_full(num_problems);
 
+                    // Binary search for new position
+                    // We want the leftmost position where idx should be placed
+                    // i.e., find smallest new_pos such that compare_teams(idx, scoreboard[new_pos]) is true for all existing teams to the right
+                    // Actually: find the first position from left where idx ranks higher than the team there
                     int old_pos = pos;
-                    int new_pos = old_pos;
-                    while (new_pos > 0 && compare_teams(idx, scoreboard[new_pos - 1])) {
-                        new_pos--;
+                    int lo = 0, hi = old_pos;
+                    while (lo < hi) {
+                        int mid = (lo + hi) >> 1;
+                        if (compare_teams(idx, scoreboard[mid])) {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
                     }
+                    int new_pos = lo;
 
                     if (new_pos < old_pos) {
                         int replaced = scoreboard[new_pos];
@@ -522,17 +532,16 @@ int main() {
                         out_char('\n');
 
                         int saved = scoreboard[old_pos];
-                        for (int i = old_pos; i > new_pos; i--) {
-                            scoreboard[i] = scoreboard[i-1];
-                        }
+                        memmove(scoreboard + new_pos + 1, scoreboard + new_pos, sizeof(int) * (old_pos - new_pos));
                         scoreboard[new_pos] = saved;
-
-                        for (int i = new_pos; i <= old_pos; i++) {
-                            teams[scoreboard[i]].ranking = i + 1;
-                        }
                     } else {
                         if (teams[idx].frozen_count == 0) pos--;
                     }
+                }
+
+                // Update rankings after scroll
+                for (int i = 0; i < num_teams; i++) {
+                    teams[scoreboard[i]].ranking = i + 1;
                 }
 
                 print_scoreboard();
