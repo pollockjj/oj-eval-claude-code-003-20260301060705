@@ -1,31 +1,28 @@
+#pragma GCC optimize("O2,unroll-loops")
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <vector>
 #include <algorithm>
-#include <unordered_map>
-
-using namespace std;
 
 static const int MAXN = 10005;
 static const int MAXM = 26;
 
 struct ProblemStatus {
     bool solved;
-    int attempts_before;
+    short attempts_before;
     int solve_time;
 
     bool frozen;
-    int frozen_submissions;
+    short frozen_submissions;
 
     bool real_solved;
-    int real_attempts_before;
+    short real_attempts_before;
     int real_solve_time;
 };
 
 struct Submission {
-    int problem;
-    int status;
+    short problem;
+    short status;
     int time;
 };
 
@@ -34,13 +31,36 @@ struct Team {
     ProblemStatus problems[MAXM];
     int solved_count;
     int penalty;
-    int solve_times_sorted[MAXM]; // descending
-    int num_solve_times;
-    int name_rank; // lexicographic rank
+    int solve_times_sorted[MAXM]; // descending order
+    int name_rank;
 
-    vector<Submission> submissions;
+    short last_sub[27][5]; // last submission index for each (prob, status)
+    Submission* subs;
+    int num_subs;
+    int subs_cap;
+
     int ranking;
-    int frozen_count; // number of frozen problems
+    int frozen_count;
+    bool dirty; // needs sort entry update
+
+    void init_subs() {
+        subs_cap = 32;
+        subs = (Submission*)malloc(sizeof(Submission) * subs_cap);
+        num_subs = 0;
+    }
+
+    void add_sub(short prob, short status, int time) {
+        if (num_subs == subs_cap) {
+            subs_cap *= 2;
+            subs = (Submission*)realloc(subs, sizeof(Submission) * subs_cap);
+        }
+        int idx = num_subs;
+        subs[num_subs++] = {prob, status, time};
+        last_sub[prob][status] = idx;
+        last_sub[prob][4] = idx;
+        last_sub[26][status] = idx;
+        last_sub[26][4] = idx;
+    }
 
     void init_problem_status(int num_problems) {
         for (int i = 0; i < num_problems; i++) {
@@ -48,35 +68,87 @@ struct Team {
         }
         solved_count = 0;
         penalty = 0;
-        num_solve_times = 0;
         ranking = 0;
         frozen_count = 0;
+        dirty = false;
+        memset(last_sub, -1, sizeof(last_sub));
     }
 
-    void recalc_displayed(int num_problems) {
+    void rebuild_sort_times(int num_problems) {
+        int cnt = 0;
+        for (int i = 0; i < num_problems; i++) {
+            if (problems[i].solved) {
+                solve_times_sorted[cnt++] = problems[i].solve_time;
+            }
+        }
+        std::sort(solve_times_sorted, solve_times_sorted + cnt, [](int a, int b) { return a > b; });
+    }
+
+    void recalc_full(int num_problems) {
         solved_count = 0;
         penalty = 0;
-        num_solve_times = 0;
+        int cnt = 0;
         for (int i = 0; i < num_problems; i++) {
             if (problems[i].solved) {
                 solved_count++;
                 penalty += 20 * problems[i].attempts_before + problems[i].solve_time;
-                solve_times_sorted[num_solve_times++] = problems[i].solve_time;
+                solve_times_sorted[cnt++] = problems[i].solve_time;
             }
         }
-        sort(solve_times_sorted, solve_times_sorted + num_solve_times, [](int a, int b) { return a > b; });
+        std::sort(solve_times_sorted, solve_times_sorted + cnt, [](int a, int b) { return a > b; });
     }
 };
 
 static int num_teams;
 static int num_problems;
-static int duration_time;
 static bool competition_started;
 static bool is_frozen;
 
 static Team teams[MAXN];
-static unordered_map<string, int> team_name_to_id;
 static int scoreboard[MAXN];
+static int temp_board[MAXN]; // temporary buffer for merge
+static bool changed[MAXN]; // track which teams changed since last flush
+static int changed_list[MAXN];
+static int num_changed;
+
+// Custom hash map
+struct NameMap {
+    static const int HASH_SIZE = (1 << 17);
+    static const int HASH_MASK = HASH_SIZE - 1;
+    struct Entry {
+        char name[24];
+        int id;
+        int next;
+    };
+    int head[HASH_SIZE];
+    Entry entries[MAXN];
+    int num_entries;
+
+    void init() {
+        memset(head, -1, sizeof(head));
+        num_entries = 0;
+    }
+    unsigned int hash(const char* s) const {
+        unsigned int h = 0;
+        while (*s) { h = h * 131 + (unsigned char)*s; s++; }
+        return h & HASH_MASK;
+    }
+    int find(const char* s) const {
+        unsigned int h = hash(s);
+        for (int i = head[h]; i != -1; i = entries[i].next) {
+            if (strcmp(entries[i].name, s) == 0) return entries[i].id;
+        }
+        return -1;
+    }
+    void insert(const char* s, int id) {
+        unsigned int h = hash(s);
+        int idx = num_entries++;
+        strcpy(entries[idx].name, s);
+        entries[idx].id = id;
+        entries[idx].next = head[h];
+        head[h] = idx;
+    }
+} name_map;
 
 static int parse_status(const char* s) {
     switch (s[0]) {
@@ -98,7 +170,7 @@ inline bool compare_teams(int a_idx, int b_idx) {
     if (a.solved_count != b.solved_count) return a.solved_count > b.solved_count;
     if (a.penalty != b.penalty) return a.penalty < b.penalty;
 
-    int cnt = a.num_solve_times;
+    int cnt = a.solved_count;
     for (int i = 0; i < cnt; i++) {
         if (a.solve_times_sorted[i] != b.solve_times_sorted[i])
             return a.solve_times_sorted[i] < b.solve_times_sorted[i];
@@ -107,14 +179,75 @@ inline bool compare_teams(int a_idx, int b_idx) {
     return a.name_rank < b.name_rank;
 }
 
+static bool first_flush;
+
 static void flush_scoreboard() {
-    sort(scoreboard, scoreboard + num_teams, compare_teams);
+    // Update sort entries for changed teams
+    for (int i = 0; i < num_changed; i++) {
+        int tid = changed_list[i];
+        teams[tid].rebuild_sort_times(num_problems);
+        teams[tid].dirty = false;
+    }
+
+    if (!first_flush || num_changed * 10 > num_teams) {
+        // Full sort for first flush or when many teams changed
+        std::sort(scoreboard, scoreboard + num_teams, compare_teams);
+        first_flush = true;
+    } else {
+        // Incremental: remove changed teams, sort them, merge back
+        // Collect changed team indices (their positions in scoreboard)
+        // and non-changed teams
+        int non_changed_count = 0;
+        int changed_count = 0;
+        static int non_changed[MAXN];
+        static int changed_teams[MAXN];
+
+        for (int i = 0; i < num_teams; i++) {
+            int tid = scoreboard[i];
+            if (changed[tid]) {
+                changed_teams[changed_count++] = tid;
+            } else {
+                non_changed[non_changed_count++] = tid;
+            }
+        }
+
+        // Sort changed teams
+        std::sort(changed_teams, changed_teams + changed_count, compare_teams);
+
+        // Merge non_changed (already sorted) with changed_teams (just sorted)
+        int i = 0, j = 0, k = 0;
+        while (i < non_changed_count && j < changed_count) {
+            if (compare_teams(non_changed[i], changed_teams[j])) {
+                temp_board[k++] = non_changed[i++];
+            } else {
+                temp_board[k++] = changed_teams[j++];
+            }
+        }
+        while (i < non_changed_count) temp_board[k++] = non_changed[i++];
+        while (j < changed_count) temp_board[k++] = changed_teams[j++];
+
+        memcpy(scoreboard, temp_board, sizeof(int) * num_teams);
+    }
+
     for (int i = 0; i < num_teams; i++) {
         teams[scoreboard[i]].ranking = i + 1;
     }
+
+    // Reset changed tracking
+    for (int i = 0; i < num_changed; i++) {
+        changed[changed_list[i]] = false;
+    }
+    num_changed = 0;
 }
 
-// Buffered I/O
+static void mark_changed(int tid) {
+    if (!changed[tid]) {
+        changed[tid] = true;
+        changed_list[num_changed++] = tid;
+    }
+}
+
+// Buffered output
 static char outbuf[1 << 22];
 static int outpos;
 
@@ -123,37 +256,34 @@ inline void flush_output() {
     outpos = 0;
 }
 
+inline void ensure_out(int need) {
+    if (outpos + need >= (1 << 22)) flush_output();
+}
+
 inline void out_char(char c) {
-    if (outpos >= (1 << 22) - 1) flush_output();
     outbuf[outpos++] = c;
 }
 
 inline void out_str(const char* s) {
-    while (*s) out_char(*s++);
+    ensure_out(256);
+    while (*s) outbuf[outpos++] = *s++;
 }
 
 inline void out_int(int x) {
-    if (x == 0) {
-        out_char('0');
-        return;
-    }
-    if (x < 0) {
-        out_char('-');
-        x = -x;
-    }
+    ensure_out(16);
+    if (x == 0) { outbuf[outpos++] = '0'; return; }
+    if (x < 0) { outbuf[outpos++] = '-'; x = -x; }
     char tmp[12];
     int len = 0;
-    while (x > 0) {
-        tmp[len++] = '0' + x % 10;
-        x /= 10;
-    }
-    for (int i = len - 1; i >= 0; i--) out_char(tmp[i]);
+    while (x > 0) { tmp[len++] = '0' + x % 10; x /= 10; }
+    for (int i = len - 1; i >= 0; i--) outbuf[outpos++] = tmp[i];
 }
 
 static void print_scoreboard() {
     for (int i = 0; i < num_teams; i++) {
         int idx = scoreboard[i];
         Team& t = teams[idx];
+        ensure_out(512);
         out_str(t.name);
         out_char(' ');
         out_int(i + 1);
@@ -165,32 +295,23 @@ static void print_scoreboard() {
             ProblemStatus& ps = t.problems[j];
             out_char(' ');
             if (ps.frozen) {
-                if (ps.attempts_before == 0) {
-                    out_char('0');
-                } else {
-                    out_char('-');
-                    out_int(ps.attempts_before);
-                }
+                if (ps.attempts_before == 0) out_char('0');
+                else { out_char('-'); out_int(ps.attempts_before); }
                 out_char('/');
                 out_int(ps.frozen_submissions);
             } else if (ps.solved) {
                 out_char('+');
-                if (ps.attempts_before > 0) {
-                    out_int(ps.attempts_before);
-                }
+                if (ps.attempts_before > 0) out_int(ps.attempts_before);
             } else {
-                if (ps.attempts_before == 0) {
-                    out_char('.');
-                } else {
-                    out_char('-');
-                    out_int(ps.attempts_before);
-                }
+                if (ps.attempts_before == 0) out_char('.');
+                else { out_char('-'); out_int(ps.attempts_before); }
             }
         }
         out_char('\n');
     }
 }
 
+// Buffered input
 static char buf[1 << 22];
 static int buf_pos, buf_len;
 
@@ -232,40 +353,41 @@ inline int readword(char* s) {
 
 int main() {
     num_teams = 0;
+    num_changed = 0;
     competition_started = false;
     is_frozen = false;
+    first_flush = false;
     outpos = 0;
+    memset(changed, 0, sizeof(changed));
+    name_map.init();
 
     char word[64];
     while (readword(word) > 0) {
         if (word[0] == 'A' && word[1] == 'D') {
-            // ADDTEAM
             char tname[24];
             readword(tname);
-
             if (competition_started) {
                 out_str("[Error]Add failed: competition has started.\n");
             } else {
-                string sname(tname);
-                if (team_name_to_id.count(sname)) {
+                if (name_map.find(tname) != -1) {
                     out_str("[Error]Add failed: duplicated team name.\n");
                 } else {
                     int id = num_teams++;
-                    team_name_to_id[sname] = id;
+                    name_map.insert(tname, id);
                     strcpy(teams[id].name, tname);
+                    teams[id].init_subs();
                     scoreboard[id] = id;
                     out_str("[Info]Add successfully.\n");
                 }
             }
         }
         else if (word[0] == 'S' && word[1] == 'T') {
-            // START
             if (competition_started) {
                 readword(word); readint(); readword(word); readint();
                 out_str("[Error]Start failed: competition has started.\n");
             } else {
                 readword(word);
-                duration_time = readint();
+                readint();
                 readword(word);
                 num_problems = readint();
                 competition_started = true;
@@ -274,10 +396,9 @@ int main() {
                     teams[i].init_problem_status(num_problems);
                 }
 
-                // Compute name ranks
                 int temp[MAXN];
                 for (int i = 0; i < num_teams; i++) temp[i] = i;
-                sort(temp, temp + num_teams, [](int a, int b) {
+                std::sort(temp, temp + num_teams, [](int a, int b) {
                     return strcmp(teams[a].name, teams[b].name) < 0;
                 });
                 for (int i = 0; i < num_teams; i++) {
@@ -290,21 +411,20 @@ int main() {
             }
         }
         else if (word[0] == 'S' && word[1] == 'U') {
-            // SUBMIT
             char pname[8], tname[24], sstat[32];
             readword(pname);
-            readword(word); // BY
+            readword(word);
             readword(tname);
-            readword(word); // WITH
+            readword(word);
             readword(sstat);
-            readword(word); // AT
+            readword(word);
             int time_val = readint();
 
             int prob = pname[0] - 'A';
             int status = parse_status(sstat);
-            int tid = team_name_to_id[string(tname)];
+            int tid = name_map.find(tname);
 
-            teams[tid].submissions.push_back({prob, status, time_val});
+            teams[tid].add_sub((short)prob, (short)status, time_val);
 
             ProblemStatus& ps = teams[tid].problems[prob];
 
@@ -330,22 +450,23 @@ int main() {
                         ps.real_solved = true;
                         ps.real_solve_time = time_val;
                         ps.real_attempts_before = ps.attempts_before;
+                        teams[tid].solved_count++;
+                        teams[tid].penalty += 20 * ps.attempts_before + time_val;
+                        mark_changed(tid);
                     } else {
                         ps.attempts_before++;
                         ps.real_attempts_before++;
+                        // Note: only mark changed if this affects ranking
+                        // Actually wrong answers don't change solved/penalty, so no need to mark
                     }
                 }
             }
-
-            teams[tid].recalc_displayed(num_problems);
         }
         else if (word[0] == 'F' && word[1] == 'L') {
-            // FLUSH
             flush_scoreboard();
             out_str("[Info]Flush scoreboard.\n");
         }
         else if (word[0] == 'F' && word[1] == 'R') {
-            // FREEZE
             if (is_frozen) {
                 out_str("[Error]Freeze failed: scoreboard has been frozen.\n");
             } else {
@@ -354,7 +475,6 @@ int main() {
             }
         }
         else if (word[0] == 'S' && word[1] == 'C') {
-            // SCROLL
             if (!is_frozen) {
                 out_str("[Error]Scroll failed: scoreboard has not been frozen.\n");
             } else {
@@ -363,25 +483,15 @@ int main() {
                 flush_scoreboard();
                 print_scoreboard();
 
-                // Scroll: process from bottom
-                // Start from the last position and work backwards
                 int pos = num_teams - 1;
                 while (pos >= 0) {
-                    // Find next team (from pos downward) with frozen problems
-                    while (pos >= 0 && teams[scoreboard[pos]].frozen_count == 0) {
-                        pos--;
-                    }
+                    while (pos >= 0 && teams[scoreboard[pos]].frozen_count == 0) pos--;
                     if (pos < 0) break;
 
                     int idx = scoreboard[pos];
-
-                    // Find smallest frozen problem
                     int prob = -1;
                     for (int j = 0; j < num_problems; j++) {
-                        if (teams[idx].problems[j].frozen) {
-                            prob = j;
-                            break;
-                        }
+                        if (teams[idx].problems[j].frozen) { prob = j; break; }
                     }
 
                     ProblemStatus& ps = teams[idx].problems[prob];
@@ -392,7 +502,7 @@ int main() {
                     ps.solve_time = ps.real_solve_time;
                     teams[idx].frozen_count--;
 
-                    teams[idx].recalc_displayed(num_problems);
+                    teams[idx].recalc_full(num_problems);
 
                     int old_pos = pos;
                     int new_pos = old_pos;
@@ -420,16 +530,8 @@ int main() {
                         for (int i = new_pos; i <= old_pos; i++) {
                             teams[scoreboard[i]].ranking = i + 1;
                         }
-                        // After moving up, the team at pos might have changed
-                        // We need to re-check from pos (the team that was pushed down to pos)
-                        // Don't decrement pos yet - re-check current position
                     } else {
-                        // No ranking change, check if this team still has frozen problems
-                        if (teams[idx].frozen_count > 0) {
-                            // Will continue with same team next iteration (same pos)
-                        } else {
-                            pos--;
-                        }
+                        if (teams[idx].frozen_count == 0) pos--;
                     }
                 }
 
@@ -438,19 +540,16 @@ int main() {
             }
         }
         else if (word[0] == 'Q' && word[6] == 'R') {
-            // QUERY_RANKING
             char tname[24];
             readword(tname);
-            string sname(tname);
-
-            if (!team_name_to_id.count(sname)) {
+            int tid = name_map.find(tname);
+            if (tid == -1) {
                 out_str("[Error]Query ranking failed: cannot find the team.\n");
             } else {
                 out_str("[Info]Complete query ranking.\n");
                 if (is_frozen) {
                     out_str("[Warning]Scoreboard is frozen. The ranking may be inaccurate until it were scrolled.\n");
                 }
-                int tid = team_name_to_id[sname];
                 out_str(tname);
                 out_str(" NOW AT RANKING ");
                 out_int(teams[tid].ranking);
@@ -458,47 +557,35 @@ int main() {
             }
         }
         else if (word[0] == 'Q' && word[6] == 'S') {
-            // QUERY_SUBMISSION
             char tname[24], pname[8], sstat[32];
             readword(tname);
-            readword(word); // WHERE
-            readword(word); // PROBLEM=xxx
+            readword(word);
+            readword(word);
             char* eq = strchr(word, '=');
             strcpy(pname, eq + 1);
-            readword(word); // AND
-            readword(word); // STATUS=xxx
+            readword(word);
+            readword(word);
             eq = strchr(word, '=');
             strcpy(sstat, eq + 1);
 
-            string sname(tname);
-
-            if (!team_name_to_id.count(sname)) {
+            int tid = name_map.find(tname);
+            if (tid == -1) {
                 out_str("[Error]Query submission failed: cannot find the team.\n");
             } else {
                 out_str("[Info]Complete query submission.\n");
-                int tid = team_name_to_id[sname];
 
                 bool all_problems = (strcmp(pname, "ALL") == 0);
-                int prob = -1;
-                if (!all_problems) prob = pname[0] - 'A';
+                int prob = all_problems ? 26 : (pname[0] - 'A');
 
                 bool all_status = (strcmp(sstat, "ALL") == 0);
-                int stat = -1;
-                if (!all_status) stat = parse_status(sstat);
+                int stat = all_status ? 4 : parse_status(sstat);
 
-                const vector<Submission>& subs = teams[tid].submissions;
-                int found_idx = -1;
-                for (int i = (int)subs.size() - 1; i >= 0; i--) {
-                    if (!all_problems && subs[i].problem != prob) continue;
-                    if (!all_status && subs[i].status != stat) continue;
-                    found_idx = i;
-                    break;
-                }
+                int found_idx = teams[tid].last_sub[prob][stat];
 
                 if (found_idx == -1) {
                     out_str("Cannot find any submission.\n");
                 } else {
-                    const Submission& s = subs[found_idx];
+                    const Submission& s = teams[tid].subs[found_idx];
                     out_str(tname);
                     out_char(' ');
                     out_char((char)('A' + s.problem));
@@ -511,7 +598,6 @@ int main() {
             }
         }
         else if (word[0] == 'E') {
-            // END
             out_str("[Info]Competition ends.\n");
             break;
         }
